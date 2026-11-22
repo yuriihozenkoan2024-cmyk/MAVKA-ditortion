@@ -1,0 +1,115 @@
+name: Build MAVKA
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+          - name: macOS
+            os: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find project folder
+        shell: bash
+        run: |
+          if [ -f CMakeLists.txt ]; then P=.; else P=$(dirname "$(find . -maxdepth 3 -name CMakeLists.txt | head -n 1)"); fi
+          echo "Project folder: $P"
+          echo "PROJ=$P" >> "$GITHUB_ENV"
+
+      - name: Configure
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" == "macOS" ]; then
+            cmake -S "$PROJ" -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DMAVKA_BUILD_TESTS=ON
+          else
+            cmake -S "$PROJ" -B build -DCMAKE_BUILD_TYPE=Release -DMAVKA_BUILD_TESTS=ON
+          fi
+
+      - name: Build plugin
+        run: cmake --build build --config Release --parallel 4 --target MAVKA_All
+
+      - name: DSP self-test
+        continue-on-error: true
+        shell: bash
+        run: |
+          cmake --build build --config Release --target mavka_test
+          if [ "$RUNNER_OS" == "Windows" ]; then T=./build/Release/mavka_test.exe; else T=./build/mavka_test; fi
+          "$T" latency
+          "$T" switch
+          "$T" stress
+          "$T" duck
+          "$T" crush
+
+      - name: Collect plugin files
+        shell: bash
+        run: |
+          mkdir -p dist out
+          ART=build/MAVKA_artefacts/Release
+          cp -R "$ART/VST3/MAVKA.vst3" dist/
+          cp "$PROJ/README.md" dist/ || true
+          if [ "$RUNNER_OS" == "macOS" ]; then
+            cp -R "$ART/AU/MAVKA.component" dist/
+            cp -R "$ART/Standalone/MAVKA.app" dist/
+            ditto -c -k dist out/MAVKA-macOS.zip
+          else
+            cp "$ART/Standalone/MAVKA.exe" dist/
+          fi
+
+      - name: Build installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          $iss = (Get-ChildItem -Path . -Recurse -Filter MAVKA.iss | Where-Object { $_.FullName -notmatch '\\build\\' } | Select-Object -First 1).FullName
+          Write-Host "Installer script: $iss"
+          & $iscc "/DSourceDir=$env:GITHUB_WORKSPACE\dist" "/O$env:GITHUB_WORKSPACE\out" $iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Compress-Archive -Path "$env:GITHUB_WORKSPACE\dist\*" -DestinationPath "$env:GITHUB_WORKSPACE\out\MAVKA-Windows.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MAVKA-${{ matrix.name }}
+          path: out
+
+  release:
+    name: Publish release
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - run: ls -la artifacts
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: MAVKA build ${{ github.run_number }}
+          make_latest: true
+          fail_on_unmatched_files: false
+          body: |
+            **MAVKA-Setup.exe** - Windows installer: one run puts the VST3 into C:\Program Files\Common Files\VST3.
+            Then in FL Studio: Options > Manage plugins > Find installed plugins.
+            Windows may show SmartScreen (unsigned installer): More info > Run anyway.
+          files: |
+            artifacts/MAVKA-Setup.exe
+            artifacts/MAVKA-Windows.zip
+            artifacts/MAVKA-macOS.zip
